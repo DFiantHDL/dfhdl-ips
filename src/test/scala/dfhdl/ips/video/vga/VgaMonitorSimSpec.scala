@@ -116,6 +116,8 @@ class VgaMonitorSimSpec extends munit.FunSuite:
         Thread.sleep(100); waited += 100
       val img = ImageIO.read(capture.toIO)
       assert(img != null, s"[$label] no frame image was captured")
+      // the viewer carries no fixed size — these dimensions are recovered purely from the per-frame
+      // PPM header (VGA_MONITOR_FORMAT=ppm), so matching them proves the metadata round-trip
       assertEquals(img.getWidth, 640, s"[$label] frame width")
       assertEquals(img.getHeight, 480, s"[$label] frame height")
       // a real captured frame is mostly non-blank (the pattern keeps the blue channel high)

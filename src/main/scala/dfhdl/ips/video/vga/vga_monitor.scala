@@ -11,6 +11,9 @@ import dfhdl.*
   * to the wrapper's `COLOR_BITS` parameter/generic); `hsync`/`vsync` are single bits. The bundled
   * binaries and HDL wrappers are unversioned — the wrapped release version lives only in
   * [[vga_monitor.version]] (and the download archive name).
+  *
+  * During simulation [[VgaMonitorSimHook]] requests the v0.4.0 self-describing `ppm` stream format,
+  * so the viewer recovers each frame's resolution from the stream itself (no fixed default).
   */
 class vga_monitor(
     val COLOR_BITS: Int <> CONST = 8
@@ -28,6 +31,16 @@ class vga_monitor(
 end vga_monitor
 
 object vga_monitor:
-  /** The wrapped vga-monitor-sim release. Keep in sync with `vgaMonitorVersion` in `build.sbt`. */
-  final val version = "0.3.0"
+  /** The wrapped vga-monitor-sim release, set from `build.sbt` (`vgaMonitorVersion`) via the
+    * generated `vga-monitor.properties` resource (mirrors core's `version.properties` and lib's
+    * `dftools.properties`). Bump it in `build.sbt`.
+    */
+  val version: String =
+    val props = new java.util.Properties()
+    // close the stream: a leaked handle blocks the build from re-copying the resource on Windows
+    // (AccessDenied during copyResources).
+    val inputStream = getClass.getClassLoader.getResourceAsStream("vga-monitor.properties")
+    try props.load(inputStream)
+    finally inputStream.close()
+    props.getProperty("vga-monitor.version")
 end vga_monitor
