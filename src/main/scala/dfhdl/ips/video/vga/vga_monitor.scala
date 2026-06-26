@@ -6,26 +6,28 @@ import dfhdl.*
   * signaling into it and, during simulation, its bundled C++ backend (loaded into the simulator via
   * a DPI/VPI/VHPI shim) reconstructs frames and streams them to a viewer ([[VgaMonitorSimHook]]).
   *
-  * The monitor is clockless and parameterless - it auto-locks sync polarity, pixel clock,
-  * resolution and offset purely from the signal. The `r`/`g`/`b` ports are 8-bit; `hsync`/`vsync`
-  * are single bits. The per-FFI library base names embed the wrapped release version (see
-  * [[vga_monitor.version]]).
+  * The monitor is clockless - it auto-locks sync polarity, pixel clock, resolution and offset
+  * purely from the signal. [[COLOR_BITS]] sizes the `r`/`g`/`b` channels (default 8, passed through
+  * to the wrapper's `COLOR_BITS` parameter/generic); `hsync`/`vsync` are single bits. The bundled
+  * binaries and HDL wrappers are unversioned — the wrapped release version lives only in
+  * [[vga_monitor.version]] (and the download archive name).
   */
-class vga_monitor extends EDBlackBox.ForeignIP:
-  val r = Bits(8) <> IN
-  val g = Bits(8) <> IN
-  val b = Bits(8) <> IN
+class vga_monitor(
+    val COLOR_BITS: Int <> CONST = 8
+) extends EDBlackBox.ForeignIP:
+  val r = Bits(COLOR_BITS) <> IN
+  val g = Bits(COLOR_BITS) <> IN
+  val b = Bits(COLOR_BITS) <> IN
   val hsync = Bit <> IN
   val vsync = Bit <> IN
 
-  override protected def dpiLib = s"vga_monitor_dpi_${vga_monitor.verSuffix}"
-  override protected def vpiModule = s"vga_monitor_${vga_monitor.verSuffix}"
-  override protected def vhpiLib = s"vga_monitor_vhpi_${vga_monitor.verSuffix}"
+  override protected def dpiLib = "vga_monitor_dpi"
+  override protected def vpiModule = "vga_monitor"
+  override protected def vhpiLib = "vga_monitor_vhpi"
   override protected def simHookClass = "dfhdl.ips.video.vga.VgaMonitorSimHook"
 end vga_monitor
 
 object vga_monitor:
   /** The wrapped vga-monitor-sim release. Keep in sync with `vgaMonitorVersion` in `build.sbt`. */
-  final val version = "0.2.0"
-  // version token embedded in the bundled binary file names, e.g. `v0_2_0`
-  final val verSuffix = "v" + version.replace('.', '_')
+  final val version = "0.3.0"
+end vga_monitor

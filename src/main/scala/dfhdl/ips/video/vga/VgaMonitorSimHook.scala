@@ -54,6 +54,7 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
         .flatMap(_.toIntOption)
         .getOrElse(0)
     new VgaMonitorSimContext(base.ipName, base.ipDir, base.topName, captureToOpt, captureFrame)
+  end context
 
   override def onSimStart(ctx: VgaMonitorSimContext): Unit =
     val (w, h) = frameSize
@@ -87,9 +88,15 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
 
   override def simEnv(ctx: VgaMonitorSimContext): Map[String, String] =
     val base = Map("VGA_MONITOR_STREAM" -> s"127.0.0.1:${ctx.port}")
-    // in capture mode, ask the backend to stop after enough frames so the simulation terminates
+    // In capture mode, bound the run with VGA_MONITOR_FRAMES so it terminates, but leave a margin
+    // ABOVE the captured frame. The backend `exit(0)`s the instant it hits this limit; if that limit
+    // were the captured frame itself, that abrupt exit races (and on a fast simulator like Verilator
+    // resets) the socket while we're still reading the frame. With margin, the viewer grabs its
+    // frame from a still-live stream and closes first (the backend then sees "viewer gone" and stops
+    // cleanly), so the read always completes. Mirrors upstream's e2e, which streams ~12 frames while
+    // the viewer grabs one.
     ctx.captureToOpt match
-      case Some(_) => base + ("VGA_MONITOR_FRAMES" -> (ctx.captureFrame + 1).toString)
+      case Some(_) => base + ("VGA_MONITOR_FRAMES" -> (ctx.captureFrame + 8).toString)
       case None    => base
 
   override def onSimEnd(ctx: VgaMonitorSimContext): Unit =
