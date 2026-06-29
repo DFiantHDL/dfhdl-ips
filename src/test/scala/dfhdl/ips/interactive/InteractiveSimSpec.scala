@@ -4,6 +4,9 @@ import dfhdl.*
 import dfhdl.options.{CompilerOptions, SimulatorOptions}
 import dfhdl.tools.simulators
 import dfhdl.tools.toolsCore.{VerilogSimulator, VHDLSimulator}
+import java.io.{BufferedReader, InputStreamReader}
+import java.net.{InetAddress, ServerSocket, Socket}
+import java.nio.charset.StandardCharsets.UTF_8
 import java.io.File.separatorChar as S
 
 /** A self-checking interactive round-trip: a viewer-driven [[interactive_ctrl]] ("sw") feeds the
@@ -44,12 +47,17 @@ end InteractivePatternSim
   * targets the GHDL/NVC VHPIDIRECT ABI, which they do not share.
   *
   * This also exercises the bundle's commonality: two distinct IPs share one C++ singleton backend,
-  * one socket/viewer hook, one set of FFI libraries and (on the VHDL side) one
-  * `interactive_pkg.vhdl` package — all of which the tool-execution stage must copy/link/compile
-  * exactly once.
+  * one socket, one set of FFI libraries and (on the VHDL side) one `interactive_pkg.vhdl` package —
+  * all of which the tool-execution stage must copy/link/compile exactly once.
   *
-  * Each tool drives [[InteractivePatternSim]] in headless capture mode: the hook pushes `sw=42` and
-  * must read `led=42` back. Tools not on the local PATH are skipped (`assume`).
+  * The actual viewer is `fpga-isv` (a GUI), so the round-trip is checked with a **pure socket
+  * exchange**: the test stands in for the viewer/server, does the interactive-sim JSON handshake
+  * directly (pushes `sw=42` when the control registers, reads back the `led` flag), and asserts the
+  * value made the full loop. The hook honors `-Ddfhdl.ips.interactive.stream=host:port` to point
+  * the backend at this test's server (and launch no GUI). Local only: the backend connects to
+  * 127.0.0.1, which under dftools would be the sim container's loopback, not this host JVM —
+  * fpga-isv itself works in dftools because it runs inside the hmi container, on the sim's WSL
+  * network. Tools not on the local PATH are skipped (`assume`).
   */
 class InteractiveSimSpec extends munit.FunSuite:
   // the slower vendor simulators (xsim/questa) compile + run well past munit's 30s default
@@ -75,38 +83,70 @@ class InteractiveSimSpec extends munit.FunSuite:
 
   private val sendValue = 42L
 
-  // Drives InteractivePatternSim through the interactive bundle in headless capture mode and asserts
-  // the viewer read back exactly the value it pushed (the full round-trip).
-  private def captureAndAssert(label: String)(using CompilerOptions, SimulatorOptions): Unit =
-    val capture = os.temp(prefix = s"interactive_$label", suffix = ".txt")
-    System.setProperty("dfhdl.ips.interactive.send", s"sw=$sendValue")
-    System.setProperty("dfhdl.ips.interactive.capture", capture.toString)
+  // Drives InteractivePatternSim through the interactive bundle while THIS test plays the viewer over
+  // a raw socket, and asserts the value pushed in came back out on the flag (the full round-trip).
+  private def roundTripAndAssert(label: String)(using CompilerOptions, SimulatorOptions): Unit =
+    val srv = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+    val port = srv.getLocalPort
+    @volatile var led: Option[Long] = None
+    val worker = new Thread(
+      () =>
+        try
+          val sock = srv.accept()
+          try exchange(sock, v => led = Some(v))
+          finally sock.close()
+        catch case _: Throwable => () // server closed at sim end, or peer reset - nothing to do
+      ,
+      s"interactive-test-viewer-$label"
+    )
+    worker.setDaemon(true)
+    worker.start()
+    // point the backend at this test's server and suppress the GUI viewer
+    System.setProperty("dfhdl.ips.interactive.stream", s"127.0.0.1:$port")
     try
       (new InteractivePatternSim).compile.commit.simPrep.simRun
-      // the viewer writes the capture file from a background thread joined at sim end; brief margin
-      var waited = 0
-      while (os.size(capture) == 0 && waited < 5000)
-        Thread.sleep(100); waited += 100
-      val flags = os.read.lines(capture).iterator
-        .map(_.trim).filter(_.nonEmpty)
-        .flatMap { line =>
-          line.split("=", 2) match
-            case Array(k, v) => v.trim.toLongOption.map(k.trim -> _)
-            case _           => None
-        }
-        .toMap
-      assert(flags.nonEmpty, s"[$label] no flag values were captured")
+      worker.join(5000)
       assertEquals(
-        flags.get("led"),
+        led,
         Some(sendValue),
-        s"[$label] viewer<->design round-trip mismatch (captured: $flags)"
+        s"[$label] viewer<->design round-trip mismatch (led=$led)"
       )
     finally
-      System.clearProperty("dfhdl.ips.interactive.send")
-      System.clearProperty("dfhdl.ips.interactive.capture")
-      os.remove.all(capture)
+      System.clearProperty("dfhdl.ips.interactive.stream")
+      try srv.close()
+      catch case _: Throwable => ()
     end try
-  end captureAndAssert
+  end roundTripAndAssert
+
+  // The interactive-sim JSON handshake from the viewer side: read newline-delimited messages; when
+  // the "sw" control registers, push sw=42; record every "led" flag value the design emits.
+  //   sim -> viewer  {"ev":"reg","t":..,"name":"sw","kind":"ctrl","width":8}
+  //                  {"ev":"flag","t":..,"name":"led","val":42}
+  //   viewer -> sim  {"name":"sw","val":42}
+  private def exchange(sock: Socket, onLed: Long => Unit): Unit =
+    val out = sock.getOutputStream
+    val in = new BufferedReader(new InputStreamReader(sock.getInputStream, UTF_8))
+    var line = in.readLine()
+    while (line != null)
+      field(line, "ev") match
+        case Some("reg")
+            if field(line, "kind").contains("ctrl") && field(line, "name").contains("sw") =>
+          out.write((s"""{"name":"sw","val":$sendValue}""" + "\n").getBytes(UTF_8))
+          out.flush()
+        case Some("flag") if field(line, "name").contains("led") =>
+          field(line, "val").flatMap(_.toLongOption).foreach(onLed)
+        case _ => ()
+      line = in.readLine()
+  end exchange
+
+  // minimal flat-JSON field extraction (string or bare/numeric token)
+  private def field(line: String, key: String): Option[String] =
+    val strRe =
+      ("\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").r
+    strRe.findFirstMatchIn(line).map(_.group(1)).orElse {
+      val numRe = ("\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*([^,}\\s]+)").r
+      numRe.findFirstMatchIn(line).map(_.group(1))
+    }
 
   for ((name, sim) <- verilogSims)
     test(s"interactive end-to-end round-trip: verilog/$name") {
@@ -115,7 +155,7 @@ class InteractiveSimSpec extends munit.FunSuite:
       given CompilerOptions.Backend = _.verilog
       given SimulatorOptions.VerilogSimulator = _ => sim
       given CompilerOptions.CommitFolder = s"sandbox${S}InteractiveSimSpec$S$label"
-      captureAndAssert(label)
+      roundTripAndAssert(label)
     }
 
   for ((name, sim) <- vhdlSims)
@@ -125,6 +165,6 @@ class InteractiveSimSpec extends munit.FunSuite:
       given CompilerOptions.Backend = _.vhdl
       given SimulatorOptions.VHDLSimulator = _ => sim
       given CompilerOptions.CommitFolder = s"sandbox${S}InteractiveSimSpec$S$label"
-      captureAndAssert(label)
+      roundTripAndAssert(label)
     }
 end InteractiveSimSpec
