@@ -56,6 +56,9 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
   private val interactiveGraceMs = 800L
   // capture: the grabber has normally already written the PNG by sim end; this only bounds a stuck one.
   private val captureFinishJoinMs = 15000L
+  // interactive: at sim end, give the worker a moment to observe stopViewer and settle (so we never
+  // leave a just-spawned ffplay orphaned) before we close it.
+  private val viewerStopJoinMs = 2000L
 
   // build our context, reading the IP-specific capture config from system properties
   def context(base: ForeignSimContext): VgaMonitorSimContext =
@@ -99,16 +102,21 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
   end simEnv
 
   override def onSimEnd(ctx: VgaMonitorSimContext)(using SimulatorOptions): Unit =
+    // runs in withForeignSimHooks' `finally`, so this covers both a normal sim end (finish()/limit
+    // reached) and an interruption (Ctrl+C). Close the viewer either way.
     ctx.stopViewer = true
-    ctx.captureToOpt match
-      case Some(_) =>
-        // wait for the grabber to flush its PNG, then make sure nothing is left running
-        Option(ctx.worker).foreach(_.join(captureFinishJoinMs))
-        Option(ctx.viewerProc).foreach(p =>
-          try if (p.wrapped.isAlive) p.wrapped.destroyForcibly()
-          catch case _: Throwable => ()
-        )
-      case None => () // leave the ffplay window open so the user can inspect the final frame
+    // capture: wait for the grabber to flush its PNG first; interactive: just let the worker settle
+    // so it can't spawn a fresh ffplay after we tear down (no orphan).
+    val joinMs = if (ctx.captureToOpt.isDefined) captureFinishJoinMs else viewerStopJoinMs
+    Option(ctx.worker).foreach(_.join(joinMs))
+    // Close the viewer window/process. ffplay is launched with `-autoexit`, so it already exits on
+    // its own the moment the backend dies and the TCP stream hits EOF — which works across the WSL
+    // boundary in dftools where killing the in-container process from the host is unreliable. This
+    // destroy is the local/immediate path (and a no-op for an already-exited capture grabber).
+    Option(ctx.viewerProc).foreach(p =>
+      try if (p.wrapped.isAlive) p.wrapped.destroyForcibly()
+      catch case _: Throwable => ()
+    )
   end onSimEnd
 
   // (Re)spawn the viewer until it connects, the deadline passes, or the run ends. In capture mode the
@@ -166,6 +174,9 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
           "-hide_banner",
           "-loglevel",
           "error",
+          // close the window when the stream ends (sim finished or Ctrl+C'd -> backend dies -> TCP
+          // EOF); this is what actually auto-closes the viewer in dftools across the WSL boundary.
+          "-autoexit",
           "-f",
           "image2pipe",
           "-vcodec",
