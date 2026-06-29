@@ -87,7 +87,9 @@ object InteractiveSimHook extends ForeignSimHook[InteractiveSimContext]:
       }
       .toMap
 
-  override def onSimStart(ctx: InteractiveSimContext): Unit =
+  override def onSimStart(ctx: InteractiveSimContext)(using
+      dfhdl.options.SimulatorOptions
+  ): Unit =
     val srv = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
     ctx.server = srv
     ctx.port = srv.getLocalPort
@@ -109,7 +111,7 @@ object InteractiveSimHook extends ForeignSimHook[InteractiveSimContext]:
   override def simEnv(ctx: InteractiveSimContext): Map[String, String] =
     Map("INTERACTIVE_STREAM" -> s"127.0.0.1:${ctx.port}")
 
-  override def onSimEnd(ctx: InteractiveSimContext): Unit =
+  override def onSimEnd(ctx: InteractiveSimContext)(using dfhdl.options.SimulatorOptions): Unit =
     Option(ctx.worker).foreach(_.join(5000))
     Option(ctx.server).foreach(s =>
       try s.close()

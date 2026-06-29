@@ -1,11 +1,10 @@
 package dfhdl.ips.video.vga
 
 import dfhdl.tools.{ForeignSimHook, ForeignSimContext}
-import java.awt.image.BufferedImage
-import java.io.{BufferedInputStream, InputStream}
-import java.net.{InetAddress, ServerSocket, Socket}
-import javax.imageio.ImageIO
-import javax.swing.{ImageIcon, JFrame, JLabel, SwingUtilities, WindowConstants}
+import dfhdl.options.SimulatorOptions
+import dfhdl.tools.toolsCore.DFToolsImage
+import java.net.{InetAddress, ServerSocket}
+import java.util.concurrent.TimeUnit
 
 /** The `vga_monitor` IP-specific simulation context: capture config (read from system properties)
   * plus the per-run viewer state. Carried through the whole hook lifecycle.
@@ -17,29 +16,47 @@ final class VgaMonitorSimContext(
     val captureToOpt: Option[os.Path],
     val captureFrame: Int
 ) extends ForeignSimContext(ipName, ipDir, topName):
-  // per-run viewer state, populated during onSimStart
-  var server: ServerSocket = compiletime.uninitialized
-  var worker: Thread = compiletime.uninitialized
-  var frame: JFrame = compiletime.uninitialized
+  // per-run viewer state, populated during onSimStart / the worker thread
   var port: Int = -1
+  var worker: Thread = compiletime.uninitialized
+  @volatile var viewerProc: os.SubProcess = compiletime.uninitialized
+  // set on sim end so a still-retrying worker stops trying to (re)connect
+  @volatile var stopViewer: Boolean = false
+end VgaMonitorSimContext
 
 /** Simulation hook for the `vga_monitor` foreign IP.
   *
-  * The vga-monitor backend, loaded into the simulator, acts as a TCP client: after it auto-locks
-  * the video geometry it connects to `VGA_MONITOR_STREAM=host:port` and streams finished frames.
-  * This hook requests the v0.4.0 self-describing `VGA_MONITOR_FORMAT=ppm` format (see [[simEnv]]),
-  * so each frame arrives as a concatenated binary PPM: a `P6\n<W> <H>\n255\n` ASCII header followed
-  * by `W*H*3` raw RGB bytes. The hook listens on an ephemeral port, reads the per-frame header to
-  * recover the resolution from the stream itself, and decodes frames into a [[BufferedImage]].
+  * Since vga-monitor-sim v1.0.0 the backend loaded into the simulator is the TCP **server**: it
+  * binds+listens on `VGA_MONITOR_STREAM=host:port` and serves each finished frame as
+  * self-describing binary PPM (`VGA_MONITOR_FORMAT=ppm`, a `P6\n<W> <H>\n255\n` header + raw RGB),
+  * to whichever viewer connects — at any time, reconnecting freely while the simulation runs
+  * unaffected.
   *
-  *   - interactive (default): shows a Swing window that repaints each frame
-  *   - capture (test): runs headless and writes the chosen frame to the requested PNG, then asks
-  *     the backend to stop (via `VGA_MONITOR_FRAMES`)
+  * So this hook no longer decodes frames or runs a windowing toolkit; it just launches a standard
+  * viewer as a **client** of that stream and points it at `127.0.0.1:port`:
+  *   - interactive (default): `ffplay` shows the live frames in a window;
+  *   - capture (test): `ffmpeg` grabs the chosen frame off the socket to a PNG.
   *
-  * The frame size is whatever the PPM headers report (no fixed default); a size change mid-stream
-  * reallocates the image. A single monitor instance is supported.
+  * The viewer runs locally (host PATH) or, when `tools-location` is `dftools`, inside the DFTools
+  * `hmi` image (with X11 forwarding for `ffplay`) — matching wherever the simulator itself runs, so
+  * both share the same loopback (the sim container and the hmi container share the WSL network
+  * namespace). A single monitor instance is supported.
   */
 object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
+  // VGA_MONITOR_FRAMES is set this many frames ABOVE the captured frame in capture mode: the backend
+  // exit(0)s (ending the sim) the instant it hits the limit, which would race/reset the socket while
+  // the grabber is still reading if the limit were the captured frame itself. With margin the grabber
+  // reads its frame from a still-live stream and finishes first.
+  private val captureFrameMargin = 8
+  // give the viewer this long to connect: the backend only starts listening after the sim process
+  // spawns (post onSimStart), and in dftools the hmi image may need a cold pull on first use.
+  private val viewerConnectDeadlineNs = 120L * 1000 * 1000 * 1000
+  private val retryBackoffMs = 250L
+  // how long to treat a surviving ffplay as "connected" (a refused connection exits fast instead).
+  private val interactiveGraceMs = 800L
+  // capture: the grabber has normally already written the PNG by sim end; this only bounds a stuck one.
+  private val captureFinishJoinMs = 15000L
+
   // build our context, reading the IP-specific capture config from system properties
   def context(base: ForeignSimContext): VgaMonitorSimContext =
     val captureToOpt =
@@ -53,143 +70,123 @@ object VgaMonitorSimHook extends ForeignSimHook[VgaMonitorSimContext]:
     new VgaMonitorSimContext(base.ipName, base.ipDir, base.topName, captureToOpt, captureFrame)
   end context
 
-  override def onSimStart(ctx: VgaMonitorSimContext): Unit =
-    val srv = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
-    ctx.server = srv
-    ctx.port = srv.getLocalPort
-    // the frame size is not known until the first PPM header arrives, so the image and the (optional)
-    // window are created by the worker once it reads that header.
-    val t = new Thread(
-      () =>
-        try
-          val sock = srv.accept()
-          try streamFrames(sock, ctx)
-          finally sock.close()
-        catch case _: Throwable => () // server closed at sim end, or peer reset - nothing to do
-      ,
-      "vga-monitor-viewer"
-    )
+  override def onSimStart(ctx: VgaMonitorSimContext)(using SimulatorOptions): Unit =
+    // pick a free loopback port for the backend to bind; reused as-is in the WSL stack under dftools.
+    ctx.port =
+      val s = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+      try s.getLocalPort
+      finally s.close()
+    // launch the viewer from a background thread: the backend is not listening yet (the sim process
+    // starts only after this returns), so the viewer is (re)spawned until it connects.
+    val t = new Thread(() => runViewer(ctx), "vga-monitor-viewer")
     t.setDaemon(true)
     t.start()
     ctx.worker = t
   end onSimStart
 
   override def simEnv(ctx: VgaMonitorSimContext): Map[String, String] =
-    // request the self-describing PPM stream (v0.4.0) so the viewer recovers each frame's geometry
-    // from the per-frame P6 header instead of assuming a fixed size.
+    // request the self-describing PPM stream so the viewer recovers each frame's geometry from the
+    // per-frame P6 header (ffmpeg/ffplay `image2pipe`/`ppm` consume it directly, resyncing on P6).
     val base = Map(
       "VGA_MONITOR_STREAM" -> s"127.0.0.1:${ctx.port}",
       "VGA_MONITOR_FORMAT" -> "ppm"
     )
-    // In capture mode, bound the run with VGA_MONITOR_FRAMES so it terminates, but leave a margin
-    // ABOVE the captured frame. The backend `exit(0)`s the instant it hits this limit; if that limit
-    // were the captured frame itself, that abrupt exit races (and on a fast simulator like Verilator
-    // resets) the socket while we're still reading the frame. With margin, the viewer grabs its
-    // frame from a still-live stream and closes first (the backend then sees "viewer gone" and stops
-    // cleanly), so the read always completes. Mirrors upstream's e2e, which streams ~12 frames while
-    // the viewer grabs one.
+    // capture mode: bound the run a few frames above the captured one (see captureFrameMargin).
     ctx.captureToOpt match
-      case Some(_) => base + ("VGA_MONITOR_FRAMES" -> (ctx.captureFrame + 8).toString)
-      case None    => base
+      case Some(_) => base +
+          ("VGA_MONITOR_FRAMES" -> (ctx.captureFrame + captureFrameMargin).toString)
+      case None => base
   end simEnv
 
-  override def onSimEnd(ctx: VgaMonitorSimContext): Unit =
-    Option(ctx.worker).foreach(_.join(5000))
-    Option(ctx.server).foreach(s =>
-      try s.close()
-      catch case _: Throwable => ()
-    )
-    // leave the interactive window open so the user can inspect the final frame; it closes via the
-    // window's own DISPOSE_ON_CLOSE. (Capture mode is headless - there is no window to keep.)
+  override def onSimEnd(ctx: VgaMonitorSimContext)(using SimulatorOptions): Unit =
+    ctx.stopViewer = true
+    ctx.captureToOpt match
+      case Some(_) =>
+        // wait for the grabber to flush its PNG, then make sure nothing is left running
+        Option(ctx.worker).foreach(_.join(captureFinishJoinMs))
+        Option(ctx.viewerProc).foreach(p =>
+          try if (p.wrapped.isAlive) p.wrapped.destroyForcibly()
+          catch case _: Throwable => ()
+        )
+      case None => () // leave the ffplay window open so the user can inspect the final frame
+  end onSimEnd
 
-  // Reads one whitespace-delimited PPM token (the magic, or a numeric field), skipping leading
-  // whitespace and `#` comment lines, and consuming the single whitespace that terminates it (so the
-  // one separator before the binary raster is eaten after the maxval). Returns "" at end of stream.
-  private def readPpmToken(in: InputStream): String =
-    var c = in.read()
-    var skipping = true
-    while (skipping)
-      if (c < 0) skipping = false
-      else if (c == '#') // comment: skip to end of line, then keep skipping whitespace
-        while (c >= 0 && c != '\n') c = in.read()
-      else if (Character.isWhitespace(c)) c = in.read()
-      else skipping = false
-    val sb = new StringBuilder
-    while (c >= 0 && !Character.isWhitespace(c))
-      sb.append(c.toChar)
-      c = in.read()
-    sb.toString
-  end readPpmToken
-
-  private def streamFrames(sock: Socket, ctx: VgaMonitorSimContext): Unit =
-    val in = new BufferedInputStream(sock.getInputStream)
-    var img: BufferedImage = null
-    var buf: Array[Byte] = null
-    var curW = -1
-    var curH = -1
-    var idx = 0
-    var continue = true
-    while (continue)
-      // each frame is a binary PPM: "P6\n<W> <H>\n255\n" then W*H*3 raw RGB bytes
-      val magic = readPpmToken(in)
-      val w = readPpmToken(in).toIntOption.getOrElse(-1)
-      val h = readPpmToken(in).toIntOption.getOrElse(-1)
-      val maxv = readPpmToken(in).toIntOption.getOrElse(-1)
-      if (magic != "P6" || w <= 0 || h <= 0 || maxv != 255)
-        continue = false // end of stream or unexpected header
-      else
-        // (re)allocate the image/buffer/window on the first frame or whenever the size changes
-        if (img == null || w != curW || h != curH)
-          curW = w
-          curH = h
-          img = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
-          buf = new Array[Byte](w * h * 3)
-          ensureWindow(ctx, img)
-        val frameBytes = w * h * 3
-        var off = 0
-        var eof = false
-        while (off < frameBytes && !eof)
-          val n = in.read(buf, off, frameBytes - off)
-          if (n < 0) eof = true else off += n
-        if (off < frameBytes) continue = false // truncated final frame
-        else
-          var p = 0
-          var y = 0
-          while (y < h)
-            var x = 0
-            while (x < w)
-              val r = buf(p) & 0xff
-              val g = buf(p + 1) & 0xff
-              val b = buf(p + 2) & 0xff
-              img.setRGB(x, y, (r << 16) | (g << 8) | b)
-              p += 3
-              x += 1
-            y += 1
-          Option(ctx.frame).foreach(f => SwingUtilities.invokeLater(() => f.repaint()))
+  // (Re)spawn the viewer until it connects, the deadline passes, or the run ends. In capture mode the
+  // grabber connects, writes the frame, and exits 0; an interactive viewer stays alive once connected.
+  // A refused connection (backend not listening yet) exits fast in both, which drives the retry.
+  private def runViewer(ctx: VgaMonitorSimContext)(using SimulatorOptions): Unit =
+    val deadlineNs = System.nanoTime + viewerConnectDeadlineNs
+    var settled = false
+    while (!settled && !ctx.stopViewer && System.nanoTime < deadlineNs)
+      val proc =
+        try Some(spawnViewer(ctx))
+        catch case _: Throwable => None
+      proc match
+        case None =>
+          sleep(retryBackoffMs) // viewer/image not launchable right now; back off and retry
+        case Some(p) =>
+          ctx.viewerProc = p
           ctx.captureToOpt match
-            case Some(path) if idx == ctx.captureFrame =>
-              os.makeDir.all(path / os.up)
-              ImageIO.write(img, "png", path.toIO)
-              continue = false
-            case _ =>
-          idx += 1
-        end if
-      end if
+            case Some(path) =>
+              val code = p.wrapped.waitFor()
+              if (code == 0 && os.exists(path) && os.size(path) > 0) settled = true
+              else sleep(retryBackoffMs)
+            case None =>
+              // still running after the grace window => connected; leave it up.
+              val exited = p.wrapped.waitFor(interactiveGraceMs, TimeUnit.MILLISECONDS)
+              if (!exited) settled = true
+              else sleep(retryBackoffMs)
+      end match
     end while
-  end streamFrames
+  end runViewer
 
-  // In interactive mode, (re)create the viewer window bound to the given image. Called when the image
-  // is (re)allocated, i.e. on the first frame and on any mid-stream size change. No-op in capture mode.
-  private def ensureWindow(ctx: VgaMonitorSimContext, img: BufferedImage): Unit =
-    if (ctx.captureToOpt.isEmpty)
-      SwingUtilities.invokeLater { () =>
-        Option(ctx.frame).foreach(_.dispose())
-        val f = new JFrame(s"VGA Monitor - ${ctx.topName}")
-        f.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE)
-        f.add(new JLabel(new ImageIcon(img)))
-        f.pack()
-        f.setVisible(true)
-        ctx.frame = f
-      }
-  end ensureWindow
+  // Spawn one viewer attempt: ffplay (interactive) or ffmpeg (capture), connecting to the backend's
+  // loopback stream. Runs on the host PATH locally, or inside the DFTools `hmi` image (with X11 for
+  // ffplay) when tools-location is dftools — matching where the simulator runs.
+  private def spawnViewer(ctx: VgaMonitorSimContext)(using to: SimulatorOptions): os.SubProcess =
+    val dftools = to.runLocation == dfhdl.options.ToolOptions.Location.dftools
+    // the simulator's mounted cwd ($PWD in the image): strip the IP's `dfhdl-ips/<ip>` resource path.
+    val execDir = ctx.ipDir / os.up / os.up
+    val stream = s"tcp://127.0.0.1:${ctx.port}"
+    val (cmd, withX11) = ctx.captureToOpt match
+      case Some(path) =>
+        // write relative to the mounted cwd in dftools so the PNG is host-readable; absolute locally.
+        val out = if (dftools) path.relativeTo(execDir).toString else path.toString
+        val select =
+          if (ctx.captureFrame > 0) Seq("-vf", s"select=eq(n\\,${ctx.captureFrame})")
+          else Seq.empty
+        val c = Seq(
+          "ffmpeg", "-hide_banner", "-loglevel", "error",
+          "-f", "image2pipe", "-vcodec", "ppm", "-i", stream
+        ) ++ select ++ Seq("-frames:v", "1", "-y", out)
+        (c, false)
+      case None =>
+        val c = Seq(
+          "ffplay",
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-f",
+          "image2pipe",
+          "-vcodec",
+          "ppm",
+          "-window_title",
+          s"VGA Monitor - ${ctx.topName}",
+          "-i",
+          stream
+        )
+        (c, true)
+    val argv = if (dftools) DFToolsImage.execArgv("hmi", cmd, withX11) else cmd
+    os.proc(argv).spawn(
+      cwd = execDir,
+      stdin = os.Inherit,
+      // drain output (ffplay/ffmpeg are quiet at -loglevel error) so the pipe never back-pressures.
+      stdout = os.ProcessOutput.Readlines(_ => ()),
+      mergeErrIntoOut = true
+    )
+  end spawnViewer
+
+  private def sleep(ms: Long): Unit =
+    try Thread.sleep(ms)
+    catch case _: InterruptedException => Thread.currentThread().interrupt()
 end VgaMonitorSimHook

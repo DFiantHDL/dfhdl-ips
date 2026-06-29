@@ -3,7 +3,7 @@ package dfhdl.ips.video.vga
 import dfhdl.*
 import dfhdl.options.{CompilerOptions, SimulatorOptions}
 import dfhdl.tools.simulators
-import dfhdl.tools.toolsCore.{VerilogSimulator, VHDLSimulator}
+import dfhdl.tools.toolsCore.{VerilogSimulator, VHDLSimulator, DFToolsImage}
 import javax.imageio.ImageIO
 import java.io.File.separatorChar as S
 
@@ -62,7 +62,8 @@ class VgaPatternSim extends RTDesign:
   mon.vsync <> vs
 
   // run plenty of frames so the interactive demo shows the animation for a while; the capture test
-  // exits much earlier (the backend stops after VGA_MONITOR_FRAMES=1), so this is just a backstop
+  // exits much earlier (the backend stops after VGA_MONITOR_FRAMES, a few frames in), so this is
+  // just a backstop
   if (frames == 60) finish()
 end VgaPatternSim
 
@@ -95,26 +96,43 @@ class VgaMonitorSimSpec extends munit.FunSuite:
     "ghdl" -> simulators.ghdl,
     "nvc" -> simulators.nvc
   )
+  // The dftools (image) cases run a representative subset to bound image pulls: verilator (DPI,
+  // `sim-verilator`) and ghdl (VHPI, `sim-llvm`). The viewer runs from the `hmi` image either way.
+  private val dftoolsVerilog = Set("verilator")
+  private val dftoolsVhdl = Set("ghdl")
+  // The DFTools image each subset simulator runs from (used to gate the dftools cases).
+  private val simImage: Map[String, String] =
+    Map("verilator" -> "sim-verilator", "ghdl" -> "sim-llvm")
 
   // shared, tool-independent options
   given options.OnError = _.Exception // a tool error fails the test rather than exiting the JVM
-  given SimulatorOptions.Location = _.local
   given SimulatorOptions.RunLimit = None
   given CompilerOptions.NewFolderForTop = false
 
-  // Drives VgaPatternSim into the vga_monitor IP in headless capture mode and asserts the viewer
-  // reconstructed a full, non-blank 640x480 frame.
-  private def captureAndAssert(label: String)(using CompilerOptions, SimulatorOptions): Unit =
-    val capture = os.temp(prefix = s"vga_frame_$label", suffix = ".png")
+  // Is ffmpeg on the local PATH? Required by the local (host) capture cases; the dftools cases get it
+  // from the `hmi` image instead.
+  private lazy val localFfmpeg: Boolean =
+    try os.proc("ffmpeg", "-hide_banner", "-version").call(check = false).exitCode == 0
+    catch case _: Throwable => false
+
+  // Drives VgaPatternSim into the vga_monitor IP in headless capture mode and asserts ffmpeg grabbed
+  // a full, non-blank 640x480 frame. The capture PNG lives under the commit folder (the mounted cwd),
+  // so it is host-readable whether ffmpeg ran locally or inside the `hmi` image.
+  private def captureAndAssert(label: String, commitFolder: String)(using
+      CompilerOptions,
+      SimulatorOptions
+  ): Unit =
+    val capture = os.Path(commitFolder, os.pwd) / "vga_frame.png"
+    os.remove.all(capture)
     System.setProperty("dfhdl.ips.vga_monitor.capture", capture.toString)
     System.setProperty("dfhdl.ips.vga_monitor.captureFrame", "0")
     try
       (new VgaPatternSim).compile.commit.simPrep.simRun
-      // the viewer writes the PNG from a background thread joined at sim end; allow a brief margin
+      // the grabber writes the PNG from a background thread joined at sim end; allow a brief margin
       var waited = 0
-      while (os.size(capture) == 0 && waited < 5000)
+      while ((!os.exists(capture) || os.size(capture) == 0) && waited < 5000)
         Thread.sleep(100); waited += 100
-      val img = ImageIO.read(capture.toIO)
+      val img = if (os.exists(capture)) ImageIO.read(capture.toIO) else null
       assert(img != null, s"[$label] no frame image was captured")
       // the viewer carries no fixed size — these dimensions are recovered purely from the per-frame
       // PPM header (VGA_MONITOR_FORMAT=ppm), so matching them proves the metadata round-trip
@@ -135,23 +153,48 @@ class VgaMonitorSimSpec extends munit.FunSuite:
     end try
   end captureAndAssert
 
-  for ((name, sim) <- verilogSims)
-    test(s"vga_monitor end-to-end frame capture: verilog/$name") {
-      assume(sim.isAvailable, s"$name not installed locally; skipping")
-      val label = s"verilog-$name"
+  // local (host PATH) and dftools (DFTools image) variants of the same capture matrix.
+  private val locations: List[(String, Boolean)] = List("local" -> false, "dftools" -> true)
+
+  for
+    (locName, dftools) <- locations
+    (name, sim) <- verilogSims
+    if !dftools || dftoolsVerilog(name)
+  do
+    test(s"vga_monitor end-to-end frame capture: $locName/verilog/$name") {
+      val label = s"$locName-verilog-$name"
       given CompilerOptions.Backend = _.verilog
       given SimulatorOptions.VerilogSimulator = _ => sim
+      given SimulatorOptions.Location = if (dftools) _.dftools else _.local
       given CompilerOptions.CommitFolder = s"sandbox${S}VgaMonitorSimSpec$S$label"
-      captureAndAssert(label)
+      if (dftools)
+        assume(DFToolsImage.isAvailable(simImage(name)), s"$name image unavailable; skipping")
+        assume(DFToolsImage.isAvailable("hmi"), "hmi (ffmpeg) image unavailable; skipping")
+      else
+        assume(sim.isAvailable, s"$name not installed locally; skipping")
+        assume(localFfmpeg, "ffmpeg not on local PATH; skipping")
+      captureAndAssert(label, s"sandbox${S}VgaMonitorSimSpec$S$label")
     }
+  end for
 
-  for ((name, sim) <- vhdlSims)
-    test(s"vga_monitor end-to-end frame capture: vhdl/$name") {
-      assume(sim.isAvailable, s"$name not installed locally; skipping")
-      val label = s"vhdl-$name"
+  for
+    (locName, dftools) <- locations
+    (name, sim) <- vhdlSims
+    if !dftools || dftoolsVhdl(name)
+  do
+    test(s"vga_monitor end-to-end frame capture: $locName/vhdl/$name") {
+      val label = s"$locName-vhdl-$name"
       given CompilerOptions.Backend = _.vhdl
       given SimulatorOptions.VHDLSimulator = _ => sim
+      given SimulatorOptions.Location = if (dftools) _.dftools else _.local
       given CompilerOptions.CommitFolder = s"sandbox${S}VgaMonitorSimSpec$S$label"
-      captureAndAssert(label)
+      if (dftools)
+        assume(DFToolsImage.isAvailable(simImage(name)), s"$name image unavailable; skipping")
+        assume(DFToolsImage.isAvailable("hmi"), "hmi (ffmpeg) image unavailable; skipping")
+      else
+        assume(sim.isAvailable, s"$name not installed locally; skipping")
+        assume(localFfmpeg, "ffmpeg not on local PATH; skipping")
+      captureAndAssert(label, s"sandbox${S}VgaMonitorSimSpec$S$label")
     }
+  end for
 end VgaMonitorSimSpec

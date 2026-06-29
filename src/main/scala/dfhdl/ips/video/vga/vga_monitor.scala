@@ -4,7 +4,8 @@ import dfhdl.*
 /** A software VGA monitor foreign IP wrapping
   * [[https://github.com/DFiantWorks/vga-monitor-sim vga-monitor-sim]]: wire your design's VGA
   * signaling into it and, during simulation, its bundled C++ backend (loaded into the simulator via
-  * a DPI/VPI/VHPI shim) reconstructs frames and streams them to a viewer ([[VgaMonitorSimHook]]).
+  * a DPI/VPI/VHPI shim) reconstructs frames and serves them over TCP to a standard viewer launched
+  * by [[VgaMonitorSimHook]] (`ffplay` live / `ffmpeg` to capture a frame).
   *
   * The monitor is clockless - it auto-locks sync polarity, pixel clock, resolution and offset
   * purely from the signal. [[COLOR_BITS]] sizes the `r`/`g`/`b` channels (default 8, passed through
@@ -12,8 +13,9 @@ import dfhdl.*
   * binaries and HDL wrappers are unversioned — the wrapped release version lives only in
   * [[vga_monitor.version]] (and the download archive name).
   *
-  * During simulation [[VgaMonitorSimHook]] requests the v0.4.0 self-describing `ppm` stream format,
-  * so the viewer recovers each frame's resolution from the stream itself (no fixed default).
+  * Since vga-monitor-sim v1.0.0 the backend is the TCP server: it streams the self-describing `ppm`
+  * (P6) format, so the viewer recovers each frame's resolution from the stream itself (no fixed
+  * default) and connects/reconnects at any time while the simulation runs unaffected.
   */
 class vga_monitor(
     val COLOR_BITS: Int <> CONST = 8
