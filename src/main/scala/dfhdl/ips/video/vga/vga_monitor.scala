@@ -10,7 +10,7 @@ import dfhdl.*
   * The monitor is clockless - it auto-locks sync polarity, pixel clock, resolution and offset
   * purely from the signal. [[COLOR_BITS]] sizes the `r`/`g`/`b` channels (default 8, passed through
   * to the wrapper's `COLOR_BITS` parameter/generic); `hsync`/`vsync` are single bits. The bundled
-  * binaries and HDL wrappers are unversioned — the wrapped release version lives only in
+  * binaries and HDL wrappers are unversioned - the wrapped release version lives only in
   * [[vga_monitor.version]] (and the download archive name).
   *
   * Since vga-monitor-sim v1.0.0 the backend is the TCP server: it streams the self-describing `ppm`
