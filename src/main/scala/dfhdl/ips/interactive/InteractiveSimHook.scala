@@ -4,7 +4,6 @@ import dfhdl.tools.{ForeignSimHook, ForeignSimContext}
 import dfhdl.options.SimulatorOptions
 import dfhdl.tools.toolsCore.DFToolsImage
 import java.net.{InetAddress, ServerSocket}
-import java.nio.charset.StandardCharsets.UTF_8
 
 /** The `interactive` IP-specific simulation context. Shared by [[interactive_ctrl]] and
   * [[interactive_flag]] — one process-global backend, one socket, one viewer — so a single context
@@ -14,14 +13,11 @@ final class InteractiveSimContext(
     ipName: String,
     ipDir: os.Path,
     topName: String,
+    platformID: Option[String],
     // test override: point the backend at an already-listening server (the test plays the viewer
     // over a raw socket); when set, launch NO GUI viewer.
-    val streamOverride: Option[String],
-    // fpga-isv board/panel config JSON (`--config`)
-    val viewerConfig: Option[String],
-    // fpga-isv bundled example board (`--example`, e.g. "ulx3s")
-    val viewerExample: Option[String]
-) extends ForeignSimContext(ipName, ipDir, topName):
+    val streamOverride: Option[String]
+) extends ForeignSimContext(ipName, ipDir, topName, platformID):
   // per-run viewer state, populated during onSimStart / the worker thread
   var port: Int = -1
   var worker: Thread = compiletime.uninitialized
@@ -38,18 +34,12 @@ end InteractiveSimContext
   * server.
   *
   * The viewer is [[https://github.com/DFiantWorks/interactive-sim-viewer fpga-isv]] (a
-  * config-driven graphical panel). This hook just launches it as a client of the active
-  * tools-location: on the host PATH locally, or inside the DFTools `hmi` image (with X11) under
-  * dftools — matching wherever the simulator runs, so both share the same loopback (the sim and hmi
-  * containers share the WSL network namespace).
-  *
-  * fpga-isv needs a board config. By default the hook auto-loads `<topName>.isv.json`, searched in
-  * the project resources (on the classpath, alongside the top design) then the current working
-  * directory, and COMMITS it to the sim folder (`sandbox/<topName>/<topName>.isv.json` —
-  * host-readable and mounted in dftools). An explicit
-  * `-Ddfhdl.ips.interactive.viewer=<config.json>` overrides the search;
-  * `-Ddfhdl.ips.interactive.example=<name>` (e.g. `ulx3s`) selects a bundled board instead. With no
-  * board configured the sim still runs (the backend is a no-op while no viewer is attached).
+  * config-driven graphical panel). It is launched **only when the top design carries a
+  * `@platformID(...)` annotation**, as `fpga-isv --example <platformID>` (the platform name — e.g.
+  * `ulx3s` — is exactly a bundled fpga-isv board). It runs on the host PATH locally, or inside the
+  * DFTools `hmi` image (with X11) under dftools — matching wherever the simulator runs, so both
+  * share the same loopback (the sim and hmi containers share the WSL network namespace). With no
+  * `@platformID` the sim still runs (the backend is a no-op while no viewer is attached).
   *
   * For automated testing the viewer is replaced by a raw socket exchange in the test itself:
   * setting `-Ddfhdl.ips.interactive.stream=host:port` makes this hook point the backend at that
@@ -64,29 +54,28 @@ object InteractiveSimHook extends ForeignSimHook[InteractiveSimContext]:
   private val viewerStopJoinMs = 2000L
 
   def context(base: ForeignSimContext): InteractiveSimContext =
-    def prop(k: String): Option[String] =
-      Option(System.getProperty(s"$sysPropPrefix.$k")).map(_.trim).filter(_.nonEmpty)
+    val streamOverride =
+      Option(System.getProperty(s"$sysPropPrefix.stream")).map(_.trim).filter(_.nonEmpty)
     new InteractiveSimContext(
       base.ipName,
       base.ipDir,
       base.topName,
-      prop("stream"),
-      prop("viewer"),
-      prop("example")
+      base.platformID,
+      streamOverride
     )
   end context
 
   override def onSimStart(ctx: InteractiveSimContext)(using SimulatorOptions): Unit =
-    // test mode: the test already listens on streamOverride and plays the viewer itself — nothing to do.
-    if (ctx.streamOverride.isEmpty)
+    // test mode (streamOverride): the test already listens and plays the viewer itself — nothing to do.
+    // Otherwise launch fpga-isv only when the top is `@platformID`-annotated (its board).
+    if (ctx.streamOverride.isEmpty && ctx.platformID.isDefined)
       // pick a free loopback port for the viewer (fpga-isv) to bind; the backend reconnects to it.
       ctx.port =
         val s = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
         try s.getLocalPort
         finally s.close()
       // launch off-thread: an image pull / GUI startup must not block the sim launch, and the
-      // backend keeps (re)connecting so the viewer can come up at its own pace. The board is
-      // resolved (and committed) inside the worker, which logs a hint if none is found.
+      // backend keeps (re)connecting so the viewer can come up at its own pace.
       val t = new Thread(() => launchViewer(ctx), "interactive-viewer")
       t.setDaemon(true)
       t.start()
@@ -94,7 +83,10 @@ object InteractiveSimHook extends ForeignSimHook[InteractiveSimContext]:
   end onSimStart
 
   override def simEnv(ctx: InteractiveSimContext): Map[String, String] =
-    Map("INTERACTIVE_STREAM" -> ctx.streamOverride.getOrElse(s"127.0.0.1:${ctx.port}"))
+    // point the backend at the test server, the launched viewer's port, or nowhere (no viewer).
+    ctx.streamOverride.orElse(Option.when(ctx.port >= 0)(s"127.0.0.1:${ctx.port}")) match
+      case Some(stream) => Map("INTERACTIVE_STREAM" -> stream)
+      case None         => Map.empty
 
   override def onSimEnd(ctx: InteractiveSimContext)(using SimulatorOptions): Unit =
     // close the viewer when the sim ends (finished or Ctrl+C'd — onSimEnd runs in
@@ -110,70 +102,26 @@ object InteractiveSimHook extends ForeignSimHook[InteractiveSimContext]:
     )
   end onSimEnd
 
-  // Launch fpga-isv as the viewer/server, on the host PATH locally or inside the DFTools `hmi` image
-  // (with X11) under dftools — matching where the simulator runs. fpga-isv binds 127.0.0.1:port and
-  // the backend connects to it. Failure (e.g. fpga-isv not installed) is non-fatal: the sim runs
-  // without a viewer.
+  // Launch `fpga-isv --example <platformID>` as the viewer/server, on the host PATH locally or inside
+  // the DFTools `hmi` image (with X11) under dftools — matching where the simulator runs. fpga-isv
+  // binds 127.0.0.1:port and the backend connects to it. Failure (e.g. fpga-isv not installed) is
+  // non-fatal: the sim runs without a viewer.
   private def launchViewer(ctx: InteractiveSimContext)(using to: SimulatorOptions): Unit =
     try
       val dftools = to.runLocation == dfhdl.options.ToolOptions.Location.dftools
       // the simulator's mounted cwd ($PWD in the image): strip the IP's `dfhdl-ips/<ip>` resource path.
       val execDir = ctx.ipDir / os.up / os.up
-      resolveBoardArgs(ctx, execDir, dftools) match
-        case None =>
-          // nothing to show; the sim still runs (the backend no-ops while no viewer is attached).
-          System.err.println(
-            s"[interactive] no viewer board found; add a ${ctx.topName}.isv.json to the project " +
-              s"resources or run dir (or set -D$sysPropPrefix.example=<name>, e.g. ulx3s) to launch fpga-isv"
-          )
-        case Some(board) =>
-          val cmd =
-            Seq("fpga-isv", "--host", "127.0.0.1", "--port", ctx.port.toString) ++ board
-          val argv = if (dftools) DFToolsImage.execArgv("hmi", cmd, withX11 = true) else cmd
-          val p = os.proc(argv).spawn(
-            cwd = execDir,
-            stdin = os.Inherit,
-            stdout = os.ProcessOutput.Readlines(_ => ()), // drain so the pipe never back-pressures
-            mergeErrIntoOut = true
-          )
-          ctx.viewerProc = p
-      end match
+      val cmd =
+        Seq("fpga-isv", "--host", "127.0.0.1", "--port", ctx.port.toString) ++
+          ctx.platformID.toSeq.flatMap(id => Seq("--example", id))
+      val argv = if (dftools) DFToolsImage.execArgv("hmi", cmd, withX11 = true) else cmd
+      val p = os.proc(argv).spawn(
+        cwd = execDir,
+        stdin = os.Inherit,
+        stdout = os.ProcessOutput.Readlines(_ => ()), // drain so the pipe never back-pressures
+        mergeErrIntoOut = true
+      )
+      ctx.viewerProc = p
     catch case _: Throwable => () // no viewer available; the sim still runs
   end launchViewer
-
-  // Resolve fpga-isv's board arguments. A `<topName>.isv.json` config is sought, in order, from:
-  //   1. an explicit `-Ddfhdl.ips.interactive.viewer=<path>` override,
-  //   2. the project resources (classpath, alongside the top design),
-  //   3. the current working directory,
-  // and, when found, is COMMITTED to `execDir/<topName>.isv.json` (the `sandbox/<topName>` folder —
-  // host-readable and mounted as the cwd in dftools) and passed as `--config` (relative to that cwd
-  // in dftools so the in-container fpga-isv can read it). Failing all of those, fall back to a bundled
-  // `-Ddfhdl.ips.interactive.example=<name>`. Returns None when no board is configured at all.
-  private[interactive] def resolveBoardArgs(
-      ctx: InteractiveSimContext,
-      execDir: os.Path,
-      dftools: Boolean
-  ): Option[Seq[String]] =
-    val name = s"${ctx.topName}.isv.json"
-    def tryReadFile(p: os.Path): Option[String] =
-      try if (os.exists(p)) Some(os.read(p)) else None
-      catch case _: Throwable => None
-    def resourceJson: Option[String] =
-      Option(getClass.getClassLoader.getResourceAsStream(name)).map { is =>
-        try new String(is.readAllBytes(), UTF_8)
-        finally is.close()
-      }
-    val json: Option[String] =
-      ctx.viewerConfig.flatMap(c => tryReadFile(os.Path(c, os.pwd))) // explicit override path
-        .orElse(resourceJson) // project resources (classpath)
-        .orElse(tryReadFile(os.pwd / name)) // current working directory
-    json match
-      case Some(content) =>
-        val committed = execDir / name
-        os.write.over(committed, content)
-        val arg = if (dftools) committed.relativeTo(execDir).toString else committed.toString
-        Some(Seq("--config", arg))
-      case None =>
-        ctx.viewerExample.map(ex => Seq("--example", ex))
-  end resolveBoardArgs
 end InteractiveSimHook
